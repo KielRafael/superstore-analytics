@@ -11,10 +11,8 @@ st.set_page_config(
 # ── STDLIB ────────────────────────────────────────────────────────────────────
 import hashlib
 import os
-import random
 import sqlite3
-from datetime import date, timedelta
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 # ── THIRD-PARTY ───────────────────────────────────────────────────────────────
 import matplotlib.pyplot as plt
@@ -22,12 +20,8 @@ import matplotlib.ticker as mticker
 import pandas as pd
 
 # ── CONSTANTS ─────────────────────────────────────────────────────────────────
-CSV_PATH = os.path.join(os.path.dirname(__file__), "SampleSuperstore.csv")
+CSV_PATH = os.path.join(os.path.dirname(__file__), "Sample_-_Superstore.csv")
 DB_PATH  = os.path.join(os.path.dirname(__file__), "superstore.db")
-
-DATE_START = date(2014, 1,  1)
-DATE_END   = date(2017, 12, 31)
-DATE_RANGE = (DATE_END - DATE_START).days
 
 # ── DATABASE HELPERS ──────────────────────────────────────────────────────────
 
@@ -172,6 +166,7 @@ def create_tables() -> None:
 # ── ETL ───────────────────────────────────────────────────────────────────────
 
 def _md5_id(prefix: str, *parts: str) -> str:
+    """Generate a short deterministic ID via MD5 hash (used for LOCATION only)."""
     raw = "|".join(str(p).strip().lower() for p in parts)
     return f"{prefix}-{hashlib.md5(raw.encode()).hexdigest()[:8].upper()}"
 
@@ -184,80 +179,139 @@ def is_db_populated() -> bool:
 
 
 def import_csv(csv_path: str) -> None:
+    """
+    Load Sample_-_Superstore.csv into the relational database.
+
+    Uses the real IDs and names from the CSV:
+      - Customer  → Customer ID, Customer Name, Segment
+      - Product   → Product ID, Product Name, Category, Sub-Category
+      - Order     → Order ID, Order Date, Ship Date, Ship Mode
+      - Location  → MD5 hash of (City, State, Postal Code)   [no natural key in CSV]
+    """
     try:
-        df = pd.read_csv(csv_path)
+        df = pd.read_csv(csv_path, encoding="latin1")
     except Exception as e:
         st.error(f"Cannot read CSV: {e}")
         return
 
     df.columns = [c.strip() for c in df.columns]
-    rng = random.Random(42)
 
-    customers, locations, products, headers, details = [], [], [], [], []
+    # ── Date normalisation  (M/D/YYYY → YYYY-MM-DD) ──────────────────────────
+    df["_order_date"] = (
+        pd.to_datetime(df["Order Date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    )
+    df["_ship_date"] = (
+        pd.to_datetime(df["Ship Date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    )
 
-    seen_orders: dict = {}
+    # ── Location ID (MD5 of city+state+postal) ────────────────────────────────
+    df["_loc_id"] = (
+        "LOC-"
+        + (
+            df["City"].str.strip().str.lower()
+            + "|"
+            + df["State"].str.strip().str.lower()
+            + "|"
+            + df["Postal Code"].astype(str).str.strip().str.lower()
+        ).apply(lambda s: hashlib.md5(s.encode()).hexdigest()[:8].upper())
+    )
 
-    for idx, row in df.iterrows():
-        # CUSTOMER
-        cust_id = _md5_id("CUST", row["Segment"], str(idx % 793))
-        customers.append((cust_id, f"Customer {cust_id[-4:]}", row["Segment"]))
+    # ── CUSTOMER ──────────────────────────────────────────────────────────────
+    cust_df = (
+        df[["Customer ID", "Customer Name", "Segment"]]
+        .drop_duplicates(subset="Customer ID")
+    )
+    customer_data = list(
+        zip(cust_df["Customer ID"], cust_df["Customer Name"], cust_df["Segment"])
+    )
 
-        # LOCATION
-        loc_id = _md5_id("LOC", row["City"], row["State"], str(row.get("Postal Code", "")))
-        locations.append((loc_id, row["City"], row["State"],
-                          str(row.get("Postal Code", "")), row["Region"], row["Country"]))
+    # ── LOCATION ──────────────────────────────────────────────────────────────
+    loc_df = (
+        df[["_loc_id", "City", "State", "Postal Code", "Region", "Country"]]
+        .drop_duplicates(subset="_loc_id")
+    )
+    location_data = list(
+        zip(
+            loc_df["_loc_id"],
+            loc_df["City"],
+            loc_df["State"],
+            loc_df["Postal Code"].astype(str),
+            loc_df["Region"],
+            loc_df["Country"],
+        )
+    )
 
-        # PRODUCT
-        prod_id = _md5_id("PROD", row["Category"], row["Sub-Category"], str(idx % 1850))
-        products.append((prod_id, f"Product {prod_id[-4:]}", row["Category"], row["Sub-Category"]))
+    # ── PRODUCT ───────────────────────────────────────────────────────────────
+    prod_df = (
+        df[["Product ID", "Product Name", "Category", "Sub-Category"]]
+        .drop_duplicates(subset="Product ID")
+    )
+    product_data = list(
+        zip(
+            prod_df["Product ID"],
+            prod_df["Product Name"],
+            prod_df["Category"],
+            prod_df["Sub-Category"],
+        )
+    )
 
-        # ORDER_HEADER — one order per row (each row is an order detail)
-        order_id = _md5_id("ORD", str(idx), row["Ship Mode"])
-        if order_id not in seen_orders:
-            order_offset  = rng.randint(0, DATE_RANGE)
-            order_date    = DATE_START + timedelta(days=order_offset)
-            ship_offset   = rng.randint(1, 7)
-            ship_date     = order_date + timedelta(days=ship_offset)
-            seen_orders[order_id] = True
-            headers.append((
-                order_id,
-                order_date.strftime("%Y-%m-%d"),
-                ship_date.strftime("%Y-%m-%d"),
-                row["Ship Mode"],
-                cust_id,
-                loc_id,
-            ))
+    # ── ORDER_HEADER (one row per unique Order ID) ────────────────────────────
+    hdr_df = (
+        df[["Order ID", "_order_date", "_ship_date", "Ship Mode",
+            "Customer ID", "_loc_id"]]
+        .drop_duplicates(subset="Order ID")
+    )
+    header_data = list(
+        zip(
+            hdr_df["Order ID"],
+            hdr_df["_order_date"],
+            hdr_df["_ship_date"],
+            hdr_df["Ship Mode"],
+            hdr_df["Customer ID"],
+            hdr_df["_loc_id"],
+        )
+    )
 
-        # ORDER_DETAIL
-        details.append((
-            order_id,
-            prod_id,
-            float(row["Sales"]),
-            int(row["Quantity"]),
-            float(row["Discount"]),
-            float(row["Profit"]),
-        ))
+    # ── ORDER_DETAIL (every row becomes one detail line) ─────────────────────
+    detail_data = list(
+        zip(
+            df["Order ID"],
+            df["Product ID"],
+            df["Sales"].astype(float),
+            df["Quantity"].astype(int),
+            df["Discount"].astype(float),
+            df["Profit"].astype(float),
+        )
+    )
 
     p = ph()
     executemany_db(
-        f"INSERT OR IGNORE INTO CUSTOMER (customer_id, customer_name, segment) VALUES ({p},{p},{p})",
-        customers,
+        f"INSERT OR IGNORE INTO CUSTOMER "
+        f"(customer_id, customer_name, segment) VALUES ({p},{p},{p})",
+        customer_data,
     )
     executemany_db(
-        f"INSERT OR IGNORE INTO LOCATION (location_id, city, state, postal_code, region, country) VALUES ({p},{p},{p},{p},{p},{p})",
-        locations,
+        f"INSERT OR IGNORE INTO LOCATION "
+        f"(location_id, city, state, postal_code, region, country) "
+        f"VALUES ({p},{p},{p},{p},{p},{p})",
+        location_data,
     )
     executemany_db(
-        f"INSERT OR IGNORE INTO PRODUCT (product_id, product_name, category, sub_category) VALUES ({p},{p},{p},{p})",
-        products,
+        f"INSERT OR IGNORE INTO PRODUCT "
+        f"(product_id, product_name, category, sub_category) VALUES ({p},{p},{p},{p})",
+        product_data,
     )
     executemany_db(
-        f"INSERT OR IGNORE INTO ORDER_HEADER (order_id, order_date, ship_date, ship_mode, customer_id, location_id) VALUES ({p},{p},{p},{p},{p},{p})",
-        headers,
+        f"INSERT OR IGNORE INTO ORDER_HEADER "
+        f"(order_id, order_date, ship_date, ship_mode, customer_id, location_id) "
+        f"VALUES ({p},{p},{p},{p},{p},{p})",
+        header_data,
     )
     executemany_db(
-        f"INSERT INTO ORDER_DETAIL (order_id, product_id, sales, quantity, discount, profit) VALUES ({p},{p},{p},{p},{p},{p})",
-        details,
+        f"INSERT INTO ORDER_DETAIL "
+        f"(order_id, product_id, sales, quantity, discount, profit) "
+        f"VALUES ({p},{p},{p},{p},{p},{p})",
+        detail_data,
     )
 
 
@@ -268,7 +322,11 @@ def year_fn() -> str:
 
 
 def month_fn() -> str:
-    return "strftime('%Y-%m', oh.order_date)" if is_sqlite() else "DATE_FORMAT(oh.order_date, '%Y-%m')"
+    return (
+        "strftime('%Y-%m', oh.order_date)"
+        if is_sqlite()
+        else "DATE_FORMAT(oh.order_date, '%Y-%m')"
+    )
 
 
 ANALYTICS_QUERIES = {
@@ -350,15 +408,15 @@ ANALYTICS_QUERIES = {
         "sql": lambda: """
             SELECT
                 CASE
-                    WHEN discount = 0            THEN 'No Discount'
-                    WHEN discount <= 0.10        THEN '1-10%'
-                    WHEN discount <= 0.20        THEN '11-20%'
-                    WHEN discount <= 0.30        THEN '21-30%'
+                    WHEN discount = 0       THEN 'No Discount'
+                    WHEN discount <= 0.10   THEN '1-10%'
+                    WHEN discount <= 0.20   THEN '11-20%'
+                    WHEN discount <= 0.30   THEN '21-30%'
                     ELSE '>30%'
                 END AS discount_bucket,
-                COUNT(*)                    AS num_orders,
-                ROUND(AVG(profit), 2)       AS avg_profit,
-                ROUND(SUM(sales),  2)       AS total_sales
+                COUNT(*)             AS num_orders,
+                ROUND(AVG(profit),2) AS avg_profit,
+                ROUND(SUM(sales), 2) AS total_sales
             FROM ORDER_DETAIL
             GROUP BY discount_bucket
             ORDER BY avg_profit DESC
@@ -368,20 +426,14 @@ ANALYTICS_QUERIES = {
         "chart": "bar",
         "title": "Average Profit by Discount Bucket",
     },
-
-    # ════════════════════════════════════════════════════════════════════════
-    # ── Query 6 (BARU) ───────────────────────────────────────────────────
-    # Teknik: SELECT WHERE, JOIN, GROUP BY, ORDER BY, AVG, COUNT
-    # Insight: Mengidentifikasi 10 negara bagian dengan rata-rata nilai pesanan
-    #          tertinggi, hanya dari pesanan yang memiliki profit positif.
-    # ════════════════════════════════════════════════════════════════════════
+    # ── Query 6 ──────────────────────────────────────────────────────────────
     "Top 10 States by Average Order Value (Profitable Orders Only)": {
         "sql": lambda: """
             SELECT l.state,
                    l.region,
-                   COUNT(DISTINCT oh.order_id)      AS total_orders,
-                   ROUND(AVG(od.sales), 2)          AS avg_order_value,
-                   ROUND(SUM(od.profit), 2)         AS total_profit
+                   COUNT(DISTINCT oh.order_id)  AS total_orders,
+                   ROUND(AVG(od.sales), 2)      AS avg_order_value,
+                   ROUND(SUM(od.profit), 2)     AS total_profit
             FROM LOCATION l
             JOIN ORDER_HEADER oh ON oh.location_id = l.location_id
             JOIN ORDER_DETAIL  od ON od.order_id   = oh.order_id
@@ -395,22 +447,15 @@ ANALYTICS_QUERIES = {
         "chart": "bar",
         "title": "Top 10 States by Avg Order Value (Profitable Orders Only)",
     },
-
-    # ════════════════════════════════════════════════════════════════════════
-    # ── Query 7 (BARU) ───────────────────────────────────────────────────
-    # Teknik: SELECT WHERE, JOIN, GROUP BY, ORDER BY, COUNT, SUM, MAX
-    # Insight: Membandingkan performa setiap metode pengiriman berdasarkan
-    #          jumlah pesanan, total penjualan, dan penjualan tertinggi dalam
-    #          satu pesanan — khusus untuk segmen Corporate.
-    # ════════════════════════════════════════════════════════════════════════
+    # ── Query 7 ──────────────────────────────────────────────────────────────
     "Ship Mode Performance for Corporate Segment": {
         "sql": lambda: """
             SELECT oh.ship_mode,
-                   COUNT(DISTINCT oh.order_id)   AS total_orders,
-                   ROUND(SUM(od.sales),  2)      AS total_sales,
-                   ROUND(AVG(od.sales),  2)      AS avg_sales_per_item,
-                   ROUND(MAX(od.sales),  2)      AS max_single_sale,
-                   ROUND(SUM(od.profit), 2)      AS total_profit
+                   COUNT(DISTINCT oh.order_id)  AS total_orders,
+                   ROUND(SUM(od.sales),  2)     AS total_sales,
+                   ROUND(AVG(od.sales),  2)     AS avg_sales_per_item,
+                   ROUND(MAX(od.sales),  2)     AS max_single_sale,
+                   ROUND(SUM(od.profit), 2)     AS total_profit
             FROM ORDER_HEADER oh
             JOIN ORDER_DETAIL od ON od.order_id   = oh.order_id
             JOIN CUSTOMER      c ON  c.customer_id = oh.customer_id
@@ -423,23 +468,16 @@ ANALYTICS_QUERIES = {
         "chart": "bar",
         "title": "Ship Mode Performance — Corporate Segment",
     },
-
-    # ════════════════════════════════════════════════════════════════════════
-    # ── Query 8 (BARU) ───────────────────────────────────────────────────
-    # Teknik: SELECT WHERE, JOIN, GROUP BY, ORDER BY, SUM, COUNT, MIN
-    # Insight: Menampilkan kategori produk dengan kuantitas pesanan terbanyak
-    #          di region tertentu (West), termasuk diskon minimum yang pernah
-    #          diberikan dan total item terjual.
-    # ════════════════════════════════════════════════════════════════════════
+    # ── Query 8 ──────────────────────────────────────────────────────────────
     "Product Category Sales Volume in West Region": {
         "sql": lambda: """
             SELECT p.category,
                    p.sub_category,
-                   COUNT(DISTINCT oh.order_id)   AS total_orders,
-                   SUM(od.quantity)              AS total_quantity_sold,
-                   ROUND(SUM(od.sales),  2)      AS total_sales,
+                   COUNT(DISTINCT oh.order_id)      AS total_orders,
+                   SUM(od.quantity)                 AS total_quantity_sold,
+                   ROUND(SUM(od.sales),  2)         AS total_sales,
                    ROUND(MIN(od.discount) * 100, 1) AS min_discount_pct,
-                   ROUND(AVG(od.profit), 2)      AS avg_profit_per_item
+                   ROUND(AVG(od.profit), 2)         AS avg_profit_per_item
             FROM PRODUCT p
             JOIN ORDER_DETAIL  od ON od.product_id  = p.product_id
             JOIN ORDER_HEADER  oh ON oh.order_id     = od.order_id
@@ -460,12 +498,14 @@ ANALYTICS_QUERIES = {
 
 BLUE = "#2563EB"
 
+
 def _fmt_dollar(x, _pos):
     if abs(x) >= 1_000_000:
         return f"${x/1_000_000:.1f}M"
     if abs(x) >= 1_000:
         return f"${x/1_000:.0f}K"
     return f"${x:,.0f}"
+
 
 dollar_fmt = mticker.FuncFormatter(_fmt_dollar)
 
@@ -525,10 +565,10 @@ def page_dashboard():
 
     metrics_sql = """
         SELECT
-            ROUND(SUM(od.sales),  2)              AS total_sales,
-            ROUND(SUM(od.profit), 2)              AS total_profit,
-            COUNT(DISTINCT oh.order_id)           AS total_orders,
-            COUNT(DISTINCT oh.customer_id)        AS total_customers
+            ROUND(SUM(od.sales),  2)       AS total_sales,
+            ROUND(SUM(od.profit), 2)       AS total_profit,
+            COUNT(DISTINCT oh.order_id)    AS total_orders,
+            COUNT(DISTINCT oh.customer_id) AS total_customers
         FROM ORDER_DETAIL od
         JOIN ORDER_HEADER oh ON oh.order_id = od.order_id
     """
@@ -555,7 +595,8 @@ def page_dashboard():
 
     cat_sql = """
         SELECT p.category, ROUND(SUM(od.profit), 2) AS profit
-        FROM PRODUCT p JOIN ORDER_DETAIL od ON od.product_id = p.product_id
+        FROM PRODUCT p
+        JOIN ORDER_DETAIL od ON od.product_id = p.product_id
         GROUP BY p.category ORDER BY profit DESC
     """
     reg_sql = """
@@ -583,7 +624,8 @@ def page_dashboard():
         SELECT p.sub_category,
                ROUND(SUM(od.sales),  2) AS sales,
                ROUND(SUM(od.profit), 2) AS profit
-        FROM PRODUCT p JOIN ORDER_DETAIL od ON od.product_id = p.product_id
+        FROM PRODUCT p
+        JOIN ORDER_DETAIL od ON od.product_id = p.product_id
         GROUP BY p.sub_category ORDER BY sales DESC
     """
     sdf = query_df(sub_sql)
@@ -609,7 +651,10 @@ def page_view_data():
 
     if filter_col != "(none)" and filter_val:
         p = ph()
-        sql    = f"SELECT * FROM {table} WHERE LOWER(CAST({filter_col} AS TEXT)) LIKE LOWER({p})"
+        sql    = (
+            f"SELECT * FROM {table} "
+            f"WHERE LOWER(CAST({filter_col} AS TEXT)) LIKE LOWER({p})"
+        )
         params = (f"%{filter_val}%",)
     else:
         sql    = f"SELECT * FROM {table}"
@@ -648,7 +693,8 @@ def page_insert():
             else:
                 cid = _md5_id("CUST", cname.strip(), segment)
                 ok  = write_db(
-                    f"INSERT OR IGNORE INTO CUSTOMER (customer_id, customer_name, segment) VALUES ({p},{p},{p})",
+                    f"INSERT OR IGNORE INTO CUSTOMER "
+                    f"(customer_id, customer_name, segment) VALUES ({p},{p},{p})",
                     (cid, cname.strip(), segment),
                 )
                 if ok:
@@ -667,7 +713,9 @@ def page_insert():
             else:
                 pid = _md5_id("PROD", pname.strip(), category, sub_cat.strip())
                 ok  = write_db(
-                    f"INSERT OR IGNORE INTO PRODUCT (product_id, product_name, category, sub_category) VALUES ({p},{p},{p},{p})",
+                    f"INSERT OR IGNORE INTO PRODUCT "
+                    f"(product_id, product_name, category, sub_category) "
+                    f"VALUES ({p},{p},{p},{p})",
                     (pid, pname.strip(), category, sub_cat.strip()),
                 )
                 if ok:
@@ -688,8 +736,11 @@ def page_insert():
             else:
                 lid = _md5_id("LOC", city.strip(), state.strip(), postal_code.strip())
                 ok  = write_db(
-                    f"INSERT OR IGNORE INTO LOCATION (location_id, city, state, postal_code, region, country) VALUES ({p},{p},{p},{p},{p},{p})",
-                    (lid, city.strip(), state.strip(), postal_code.strip(), region, country.strip()),
+                    f"INSERT OR IGNORE INTO LOCATION "
+                    f"(location_id, city, state, postal_code, region, country) "
+                    f"VALUES ({p},{p},{p},{p},{p},{p})",
+                    (lid, city.strip(), state.strip(), postal_code.strip(),
+                     region, country.strip()),
                 )
                 if ok:
                     st.success(f"Location added. ID: {lid}")
@@ -768,6 +819,9 @@ def render_sidebar():
         st.markdown("---")
 
         if st.button("Initialize / Reset Database", use_container_width=True):
+            # Drop all tables first to ensure a clean slate
+            for tbl in ["ORDER_DETAIL", "ORDER_HEADER", "PRODUCT", "CUSTOMER", "LOCATION"]:
+                write_db(f"DROP TABLE IF EXISTS {tbl}")
             create_tables()
             with st.spinner("Loading data from CSV..."):
                 import_csv(CSV_PATH)
